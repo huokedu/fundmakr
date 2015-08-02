@@ -1,0 +1,11 @@
+name = Fundmakr
+description = Fundmakr functions
+core = 7.x
+package = Fundmakr
+
+dependencies[] = currency_api
+dependencies[] = stripe
+dependencies[] = stripe_payment
+dependencies[] = postal_code_validation
+
+files[] = views/fundmakr.views.inc

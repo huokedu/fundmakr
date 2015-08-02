@@ -1,0 +1,1031 @@
+<?php
+
+/**
+ * Define default values for the module.
+ */
+define('DEFAULT_COUNTRY', 'US');
+define('STRIPE_PLAN_PREFIX', 'fm_');
+define('DEFAULT_PAYMENT_METTHOD_ID', 3);
+define('OFFLINE_DONATE_PAYMENT_METHOD_ID', 4);
+
+/**
+ * Implements hook_init().
+ */
+function fundmakr_init() {
+  drupal_add_js(drupal_get_path('module', 'fundmakr').'/js/script.js', 'file');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function fundmakr_menu() {
+
+  $items['admin/config/fundmakr/settings'] = array(
+    'title' => 'Fundmakr Settings',
+    'description' => t('Fundmakr Settings'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('fundmakr_admin_settings'),
+    'access arguments' => array('administer fundmakr settings'),
+    'file' => 'fundmakr.settings.inc',
+    'file path' => drupal_get_path('module', 'fundmakr'),
+  );
+
+  $items ['node/%node/donations/add-offline'] = array(
+    'title callback' => 'add_some_title',
+    'description' => 'Form for offline donation for a campaign.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('off_donate_form'),
+    'access callback' => 'node_access',
+    'access arguments' => array('update', 1),
+  );
+
+  return $items;
+}
+
+/**
+ * Add a custom title to Add Offline Donation page.
+ *
+ * title callback for node/%node/donations/add-offline
+ */
+function add_some_title() {
+  return 'Add offline donation for '.drupal_get_title();
+}
+
+/**
+ * Generates the Add Offline Donation form elements.
+*/
+function off_donate_form($form, &$form_state) {
+
+  $node = menu_get_object();
+
+  $fundraiser = user_load($node->uid);
+
+  $payment_method = entity_load_single('payment_method', OFFLINE_DONATE_PAYMENT_METHOD_ID);
+
+  $currency_code = strtoupper(get_user_currency($fundraiser->uid));
+
+  $description = variable_get('fundmakr_settings_payment_method_description', '');
+
+  $form['amount'] = array(
+    '#currency_code' => $currency_code,
+    '#title' => t('Amount'),
+    '#type' => 'currency_amount',
+    '#required' => TRUE
+  );
+
+
+
+  $payment = new Payment(array(
+    'context' => 'fundmakr',
+    'context_data' => array(
+      'destination' => $_GET['q'],
+    ),
+    'currency_code' => $currency_code,
+    'description' => $description,
+    'method' => $payment_method,
+    'finish_callback' => 'fundmakr_payment_finish',
+  ));
+
+  $form_info = payment_form_embedded($form_state, $payment, array(OFFLINE_DONATE_PAYMENT_METHOD_ID));
+  $form['payment_method']['#title'] = '';
+  unset($form_info['elements']['payment_line_items']);
+  unset($form_info['elements']['payment_status']);
+  $form = array_merge($form, $form_info['elements']);
+
+  $form['submit'] = array(
+    '#value' => 'Donate',
+    '#type' => 'submit',
+    '#submit' => array_merge(array('off_donate_form_submit'), $form_info['submit']),
+    '#weight' => 10,
+  );
+
+  return $form;
+}
+
+
+function off_donate_form_submit($form, &$form_state) {
+
+  $payment = $form_state['payment'];
+
+  entity_save('payment', $payment);
+  $payment->execute();
+
+}
+
+function off_donate_form_validate($form, &$form_state) {
+
+  $node = menu_get_object();
+
+  $payment =& $form_state['payment'];
+
+  $amount = $form_state['values']['amount']['amount'];
+
+  $payment->setLineItem(new PaymentLineItem(array(
+    'amount' => $amount,
+    'description' => variable_get('fundmakr_payment_description', ''),
+    'name' => 'fundmakr',
+  )));
+
+  $payment->field_campaign_nid['und'][0]['value'] = $node->nid; // set campaign nid for payment relationship
+
+
+  try {
+    $payment->method->validate($payment);
+  }
+  catch (PaymentValidationException $e) {
+    $message = strlen($e->getMessage()) ? $e->getMessage() : t('The action cannot be executed.');
+    form_error($form['amount'], $message);
+  }
+
+}
+
+
+function fundmakr_donate_form($form, &$form_state) {
+
+  $node = menu_get_object();
+
+  $fundraiser = user_load($node->uid);
+
+
+  $form['#attributes']['data-toggle'][] = 'validator';
+
+  $pmid = variable_get('fundmakr_settings_payment_method', 0);
+
+  //$currency_code = variable_get('fundmakr_settings_currency_code', 'USD');
+  $currency_code = strtoupper(get_user_currency($fundraiser->uid));
+
+
+  $description = variable_get('fundmakr_settings_payment_method_description', '');
+
+  if (!$currency_code || !$pmid) {
+    $form['#access'] = FALSE;
+    drupal_set_message(t('No payment method or description have been configured for Payment donation form.'), 'error');
+    return $form;
+  }
+
+  $payment_method = entity_load_single('payment_method', $pmid);
+
+  $payment_method->controller_data['keys']['mode'] = 1; // set mode to use Fundraiser's publishable key
+  $payment_method->controller_data['keys']['publishable'] = set_fundraiser_publishable_key(); // the publishable key
+
+  $payment_method->title_specific = '';
+  $payment_method->title_generic = '';
+
+
+  $amounts = recommended_amounts(get_currency_symbol(get_user_currency($fundraiser->uid)));
+  $amounts['other'] = t('Other amount');
+
+  // let's put the form elements into a good looking fieldset
+
+  $form['your_donation'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Donate'),
+    '#weight' => -20
+  );
+
+  $form['your_donation']['x_amount'] = array(
+    '#type' => 'radios',
+    '#options' => $amounts,
+    '#title' => t('Donation amount'),
+    '#attributes' => array('class' => array('donate-recommended-amount', 'radio')),
+    '#prefix' => '<div class="donate-recommended">',
+    '#suffix' => '</div>',
+    '#weight' => -4,
+    '#required' => TRUE,
+  );
+
+
+  $form['your_donation']['x_other_amount'] = array(
+    '#type' => 'textfield',
+    '#size' => 4,
+    '#title' => t('Other amount'),
+    '#attributes' => array('class' => array('donate-other-amount')),
+    '#default_value' => '',
+    '#weight' => -3,
+    '#description' => t('Please enter an amount not present above. (Maximum donation limit of '.get_currency_symbol(get_user_currency($fundraiser->uid)).'1000)'),
+    '#element_validate' => array('element_validate_integer_positive'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="x_amount"]' => array('value' => 'other'),
+      ),
+    ),
+    '#maxlength' => 4,
+  );
+
+  $variables = array(
+    'rows' => array(
+      array('data' => array(
+        array('data' => 'Your Donation', 'class' => 'left'),
+        array('data' => get_currency_symbol(get_user_currency($fundraiser->uid)).'0', 'class' => 'right', 'id' => 'your-donation'),
+      )),
+      array('data' => array(
+        array('data' => 'Fundmakr Handling Fee - <span id="app-fee">'.variable_get('fundmakr_settings_application_fee', 0).'</span>%', 'class' => 'left'),
+        array('data' => get_currency_symbol(get_user_currency($fundraiser->uid)).'0', 'class' => 'right', 'id' => 'fundmakr-handling-fee'),
+      )),
+      array('data' => array(
+        array('data' => 'Stripe Processing Fee</br>(2.9% + 30¢ per successful charge)', 'class' => 'left'),
+        array('data' => get_currency_symbol(get_user_currency($fundraiser->uid)).'0', 'class' => 'right', 'id' => 'stripe-fee'),
+      )),
+      array('data' => array(
+        array('data' => 'TOTAL', 'class' => 'left'),
+        array('data' => get_currency_symbol(get_user_currency($fundraiser->uid)).'0', 'class' => 'right', 'id' => 'donation-total'),
+      )),
+    ),
+    'attributes' => array(
+      'class' => array('table-confirm-donation'),
+      'width' => '100%',
+    ),
+    'caption' => 'Confirm Your Donation - Fees are deducted from each donation.',
+    'header' => NULL,
+    'colgroups' => NULL,
+    'sticky' => NULL,
+    'empty' => NULL
+  );
+  $c_table = theme_table($variables);
+
+  $form['your_donation']['calculation'] = array(
+    '#markup' => t($c_table),
+    '#weight' => -2,
+  );
+
+  $form['your_donation']['is_donate_monthly'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Make this a monthly donation'),
+    '#weight' => -1,
+  );
+
+
+
+
+  $payment = new Payment(array(
+    'context' => 'fundmakr',
+    'context_data' => array(
+      'destination' => $_GET['q'],
+    ),
+    'currency_code' => $currency_code,
+    'description' => $description,
+    'finish_callback' => 'fundmakr_payment_finish',
+    'method' => $payment_method,
+  ));
+  $form_info = payment_form_embedded($form_state, $payment, array($pmid));
+  unset($form_info['elements']['payment_line_items']);
+  unset($form_info['elements']['payment_status']);
+
+
+
+  // combine fieldset with payment form elements and attach the rest of the elements later
+
+
+
+  $form_info['elements']['payment_method']['#title'] = '';
+  $form_info['elements']['field_billing_address']['#weight'] = -5;
+
+  $form = array_merge($form, $form_info['elements']);
+
+  $form['payment_information'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Payment Information'),
+    '#weight' => 10,
+  );
+
+  $form['payment_information']['field_cardholder_name'] = $form['field_cardholder_name'];
+  $form['payment_information']['field_cardholder_name']['#weight'] = -5;
+  unset($form['field_cardholder_name']);
+
+
+  $form['payment_information']['cc_image'] = array(
+    '#markup' => t('<img src="/'.drupal_get_path('module', 'fundmakr').'/img/credit_card.gif">'),
+  );
+
+  $form['payment_information']['payment_method'] = $form['payment_method'];
+  unset($form['payment_method']);
+
+
+  $form['donate'] = array(
+    '#value' => t('Donate'),
+    '#type' => 'submit',
+    '#weight' => 11,
+    '#submit' => array_merge(array('fundmakr_donate_form_submit'), $form_info['submit']),
+  );
+
+  $form['terms'] = array(
+    '#markup' => t('<div class="donate-terms">Your donation to <strong>@campaigntitle</strong> and your Processing Fee are managed by Fundmakr LLC and processed through <strong>@fundraiser</strong> Stripe account. A receipt of your donation will be emailed to you. By clicking the "Donate" button above, you agree to the <a href="/terms-of-use" target="_blank">Terms of Use</a> and understand that your donation is non-refundable.</div>', array('@campaigntitle' => $node->title, '@fundraiser' => $fundraiser->field_first_name[LANGUAGE_NONE][0]['value'].' '.$fundraiser->field_last_name[LANGUAGE_NONE][0]['value'])),
+    '#weight' => 12,
+  );
+
+  $form['user_currency'] = array(
+    '#type' => 'hidden',
+    '#value' => t(get_currency_symbol(get_user_currency($fundraiser->uid))),
+    '#attributes' => array('id' => 'user_currency'),
+  );
+
+  return $form;
+}
+
+function fundmakr_form_fundmakr_donate_form_alter(&$form, &$form_state, $form_id) {
+
+  // merge email cck to billing address group and unset existing email cck so that it won't show twice
+  $form['field_billing_address'][LANGUAGE_NONE][0]['name_block']['donor_email'] = $form['field_donor_email_address'];
+  unset($form['field_donor_email_address']);
+
+}
+
+/**
+ * Implements form validate callback.
+ */
+
+function fundmakr_donate_form_validate(array $form, array &$form_state) {
+  $node = menu_get_object();
+
+  if (isset($node) && $node->type == 'campaign') {
+    $fundraiser_uid = $node->uid;
+
+  }
+
+  $account = user_load($fundraiser_uid);
+
+  $fundraiser_access_token = $account->field_stripe_connect['und'][0]['stripe_access_token'];
+
+  $payment =& $form_state['payment'];
+
+  $amount = $form_state['values']['x_amount'];
+  if ($amount == 'other') {
+    $amount = $form_state['values']['x_other_amount'];
+  }
+
+  $payment->method->controller_data['keys']['secret'] = $fundraiser_access_token; // we set Fundraiser's access token a.k.a secret key
+
+  $payment->setLineItem(new PaymentLineItem(array(
+    'amount' => $amount,
+    'description' => variable_get('fundmakr_payment_description', ''),
+    'name' => 'fundmakr',
+  )));
+
+
+  try {
+    $payment->method->validate($payment);
+  }
+  catch (PaymentValidationException $e) {
+    $message = strlen($e->getMessage()) ? $e->getMessage() : t('The donation cannot be executed.');
+    form_error($form['amount'], $message);
+
+  }
+
+}
+
+/**
+ * Implements form submit callback.
+ */
+function fundmakr_donate_form_submit(array $form, array &$form_state) {
+
+  /** @var Payment $payment */
+  $payment = $form_state['payment'];
+  $application_fee_percent = variable_get('fundmakr_settings_application_fee', 0);
+  $amount = $payment->totalAmount(TRUE);
+  $amount_in_cents = (check_zero_decimal_currency($payment->currency_code) ? $amount : $amount * 100);
+  // Stripe process
+
+
+  if ($form_state['values']['is_donate_monthly']) {
+
+
+    $api_key = $payment->method->controller_data['keys']['secret']; // secret key for stripe request
+    $card_token = $payment->method_data['token']; // token from submitted card
+    $customer_email = $form_state['values']['donor_email'];
+
+
+    try {
+      $r = \Stripe\Plan::retrieve(STRIPE_PLAN_PREFIX.$amount, $api_key);
+      if (!empty($r)) {
+        // subscribe the customer
+        _subscribe_stripe_customer($card_token, $customer_email, $api_key, $application_fee_percent, $amount);
+      }
+    }
+    catch (Exception $e) {
+      // create the plan and subscribe the customer
+      _create_stripe_plan($amount_in_cents, $amount, $api_key, $payment->currency_code);
+      _subscribe_stripe_customer($card_token, $customer_email, $api_key, $application_fee_percent, $amount);
+    }
+    $payment->method_data['charge'] = 1;
+  }
+
+  else {
+    // set an application fee here...
+    $payment->method_data['application_fee'] = number_format(($application_fee_percent / $amount) * 100, 0); // application fee in amount for Stripe_Charge::create();
+  }
+
+
+
+  // save payment values
+  entity_save('payment', $payment);
+  // execute our function which has some Stripe processes
+  $payment->execute();
+}
+
+function update_total_donation($nid, $donation_amount) {
+  $edit = node_load($nid);
+  $edit->field_total_donation['und'][0]['value'] += $donation_amount;
+  //Field attach update
+  field_attach_update('node', $edit);
+
+}
+
+function _subscribe_stripe_customer($card_token, $customer_email, $api_key, $application_fee_percent, $amount) {
+  try {
+    $customer = \Stripe\Customer::create(array(
+      "source" => $card_token,
+      "plan" => STRIPE_PLAN_PREFIX.$amount,
+      "email" => $customer_email), $api_key
+    );
+    //$cu = \Stripe\Customer::retrieve($customer->id);
+    //$customer->subscriptions->update(array(
+     //"application_fee_percent" => $application_fee_percent
+     //),
+     //$api_key // user's access token from the Stripe Connect flow
+    //);
+    return TRUE;
+  }
+  catch(Exception $e) {
+    watchdog('stripe', '\Stripe\Customer::create Exception: %str', array('%str' => $e->getMessage()));
+    drupal_set_message('Something went wrong. Please contact the Administrator.', 'error');
+
+    return;
+  }
+}
+
+function _create_stripe_plan($amount_in_cents, $amount, $api_key, $stripe_currency_code) {
+  try {
+    \Stripe\Plan::create(array(
+      "amount" => $amount_in_cents,
+      "interval" => "month",
+      "name" => $amount."/month Fundmakr Plan",
+      "currency" => $stripe_currency_code,
+      "id" => STRIPE_PLAN_PREFIX.$amount), $api_key
+    );
+  }
+  catch(Exception $e) {
+    watchdog('stripe', '\Stripe\Plan::create Exception: %str', array('%str' => $e->getMessage()));
+    drupal_set_message('Something went wrong. Please contact the Administrator.', 'error');
+    return;
+  }
+}
+
+/**
+ * Implements Payment::finish_callback.
+ */
+function fundmakr_payment_finish(Payment $payment) {
+
+  // Update total donation on node if payment is successful
+  update_total_donation($payment->field_campaign_nid['und'][0]['value'], $payment->totalAmount(TRUE));
+
+  if (payment_access('view', $payment)) {
+    $view = ' ' . l(t('View payment'), 'payment/' . $payment->pid) . '.';
+  }
+  if (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_PENDING)) {
+    drupal_set_message(t('Something went wrong. Please contact Administrator.') . $view);
+  }
+  elseif (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_SUCCESS)) {
+    drupal_set_message(t('Your donation bas been collected.'));
+  }
+  elseif (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_FAILED)) {
+    drupal_set_message(t('Something went wrong. Please contact Administrator.') . $view);
+  }
+
+  drupal_goto($payment->context_data['destination']);
+}
+
+function recommended_amounts($currency_symbol) {
+  $amounts = array();
+  $recommended_amounts = variable_get('fundmakr_settings_recommended_amounts', '');
+  if ($recommended_amounts) {
+    foreach (explode("\n", $recommended_amounts) as $item) {
+      list($key, $val) = explode('|', $item);
+      if (!$val) $val = $key;
+      $amounts[(float)trim(filter_xss($key))] = trim(filter_xss($currency_symbol.$val));
+    }
+  }
+  return $amounts;
+}
+
+function get_user_currency($uid) {
+  $account = user_load($uid);
+  return (empty($account->data['user_currency']) ? 'usd' : $account->data['user_currency']);
+}
+
+function get_currency_symbol($currency_code) {
+  return currency_load(strtoupper($currency_code))->sign;
+}
+
+/**
+ * Implements hook_element_info_alter()
+ */
+
+function fundmakr_element_info_alter(&$type) {
+
+  $type['stripe_payment']['#process'][] = '_stripe_custom_process';
+  // make this a non-boolean
+  $type['stripe_payment']['#cardholder_name'] = '';
+
+}
+
+function set_fundraiser_publishable_key() {
+  $node = menu_get_object(); // since default type is 'node'
+
+  if (isset($node) && $node->type == 'campaign') {
+    $account = user_load($node->uid); // load fundraiser UID
+    if (isset($account->field_stripe_connect['und'][0]['stripe_publishable_key'])) {
+      return $account->field_stripe_connect['und'][0]['stripe_publishable_key'];
+    }
+    else {
+      return stripe_get_key('publishable');
+    }
+  }
+
+}
+
+
+function _stripe_custom_process($element, $complete_form) {
+
+
+  // description alteration
+
+  $element['number']['#description'] = t('Example: 4444444444444444');
+  $element['number']['#attributes']['class'] = array('card-number');
+  $element['number']['#prefix'] = '<div class="card-number">';
+  $element['cvc']['#prefix'] = '<div class="card-cvc">';
+  $element['expiry_year']['#prefix'] = '<div class="card-expiration-year">';
+  $element['expiry_month']['#prefix'] = '<div class="card-expiration-month">';
+  $element['number']['#suffix'] = '</div>';
+  $element['cvc']['#suffix'] = '</div>';
+  $element['expiry_year']['#suffix'] = '</div>';
+  $element['expiry_month']['#suffix'] = '</div>';
+  $element['number']['#required'] = TRUE;
+  $element['number']['#size'] = 16;
+  $element['cvc']['#attributes']['class'] = array('card-cvc');
+  $element['cvc']['#description'] = t('Example: 123');
+  $element['cvc']['#required'] = TRUE;
+  $element['expiry_year']['#required'] = TRUE;
+  $element['expiry_year']['#attributes']['class'] = array('card-expiration-year');
+  $element['expiry_month']['#attributes']['class'] = array('card-expiration-month');
+  $element['expiry_month']['#required'] = TRUE;
+
+
+
+
+
+  return $element;
+}
+
+function _fundmakr_postal_code_validation($element, &$form_state) {
+
+  $validate_result = postal_code_validation_validate($element['#value'], DEFAULT_COUNTRY);
+  if ($validate_result['error']) {
+    form_error($element, t($validate_result['error']));
+  }
+}
+
+function percentage($goal, $total_donation) {
+  return round(($total_donation / $goal) * 100);
+}
+
+/**
+ * Implements hook_page_alter()
+ */
+
+function fundmakr_page_alter(&$page) {
+  // Initialize Facebook Javascript SDK
+  $page['page_bottom']['fb-init-code'] = array(
+    '#markup' => '<div id="fb-root"></div>
+                <script>(function(d, s, id) {
+                  var js, fjs = d.getElementsByTagName(s)[0];
+                  if (d.getElementById(id)) return;
+                  js = d.createElement(s); js.id = id;
+                  js.src = "//connect.facebook.net/en_GB/sdk.js#xfbml=1&version=v2.3&appId=733341883453565";
+                  fjs.parentNode.insertBefore(js, fjs);
+                }(document, "script", "facebook-jssdk"));</script>',
+  );
+
+}
+
+/**
+ * Implements hook_form_alter()
+ */
+
+function fundmakr_form_alter(&$form, &$form_state, $form_id) {
+  global $user;
+  if ($user->uid != 1) {
+    $js = 'jQuery(document).ready(function($) {
+      $curr = $("#' . $form['#id'] . ' fieldset.filter-wrapper").prev();
+      $curr.css("display", "none");
+      $("#' . $form['#id'] . ' fieldset.filter-wrapper").hide();
+    });';
+    drupal_add_js($js, 'inline');
+  }
+
+
+  switch ($form_id) {
+    case 'user_profile_form':
+
+      hide($form['account']['fboauth']);
+      hide($form['account']['facebook_rules_allow']);
+      if ($user->uid != 1) {
+        $form['field_stripe_connect']['#access'] = FALSE;
+      }
+
+      $form['terms'] = array(
+        '#markup' => t('<span class="terms">By clicking Save button, you agreed to our <a href="/privacy-policy">Privacy Policy Statement</a>.</span>'),
+        '#weight' => 100
+      );
+      $form['picture']['#title'] = t('Profile');
+      break;
+
+    case 'off_donate_form' :
+
+      unset($form['payment_method']);
+      unset($form['field_billing_address']);
+      unset($form['field_cardholder_name']);
+
+      break;
+
+    case 'user_register_form' :
+
+      hide($form['field_address']);
+
+      break;
+
+    case 'fundmakr_donate_form' :
+
+
+      break;
+
+    default:
+      # code...
+      break;
+  }
+}
+
+/**
+ * Implements hook_block_info()
+ */
+
+function fundmakr_block_info() {
+  $blocks['basic_settings'] = array(
+    'info' => t('Basic Settings'),
+  );
+  $blocks['facebook_settings'] = array(
+    'info' => t('Facebook Settings'),
+  );
+  $blocks['stripe_settings'] = array(
+    'info' => t('Stripe Settings'),
+  );
+  $blocks['fundmakr_donate_form'] = array(
+    'info' => t('Fundmakr Donation Form'),
+  );
+  $blocks['fundmakr_fb_comment'] = array(
+    'info' => t('Fundmakr FB Comment Form'),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view()
+ */
+
+
+function fundmakr_block_view($delta = '') {
+
+  global $user;
+  global $base_url;
+  $account = user_load($user->uid);
+  $form_state = array();
+  // attach the user object as an array to $form_state
+  $form_state['build_info']['args'] = array($account);
+  form_load_include($form_state, 'inc', 'user', 'user.pages');
+
+  $block = array();
+
+  switch($delta) {
+    case 'basic_settings':
+
+      $block['subject'] = t('Basic Settings');
+      $block['content'] = render(drupal_build_form('user_profile_form', $form_state));
+    break;
+
+    case 'facebook_settings':
+      $block['subject'] = t('Facebook Settings');
+      $block['content'] = drupal_get_form('facebook_settings_form');
+
+    break;
+
+    case 'stripe_settings' :
+      $block['subject'] = t('Facebook Settings');
+      $block['content'] = theme('fundmakr_stripe_settings', array('uid' => $account->uid));
+    break;
+
+    case 'fundmakr_donate_form' :
+      $block['content'] = drupal_get_form('fundmakr_donate_form');
+    break;
+    case 'fundmakr_fb_comment' :
+      $block['content'] = '<div class="fb-comments" data-href="'.$base_url.'/'.current_path().'" data-width="100%" data-numposts="10" data-colorscheme="light"></div>';
+    break;
+
+    default:
+    # code...
+    break;
+
+  }
+
+  return $block;
+}
+
+/**
+* Implements hook_block_view_alter()
+*/
+function fundmakr_block_view_alter(&$data, $block) {
+
+  if (current_path() == 'dashboard') {
+    if ($block->delta == 'dashboard_tabs') {
+
+      $data['content']['content']['tabs']['tablinks'][0]['#options']['html'] = TRUE;
+      $data['content']['content']['tabs']['tablinks'][0]['#title'] = '<div class="icon-wrapper icon-wrapper-show">
+                      <i class="fa fa fa-user fa-1x"></i><span class="menu-title">
+                  '.$data['content']['content']['tabs']['tablinks'][0]['#title'].'</span></div>';
+      $data['content']['content']['tabs']['tablinks'][1]['#options']['html'] = TRUE;
+      $data['content']['content']['tabs']['tablinks'][1]['#title'] = '<div class="icon-wrapper icon-wrapper-show">
+                      <i class="fa fa fa-cc-stripe fa-1x"></i><span class="menu-title">
+                  '.$data['content']['content']['tabs']['tablinks'][1]['#title'].'</span></div>';
+      $data['content']['content']['tabs']['tablinks'][2]['#options']['html'] = TRUE;
+      $data['content']['content']['tabs']['tablinks'][2]['#title'] = '<div class="icon-wrapper icon-wrapper-show">
+                      <i class="fa fa fa-pencil-square-o fa-1x"></i><span class="menu-title">
+                  '.$data['content']['content']['tabs']['tablinks'][2]['#title'].'</span></div>';
+      $data['content']['content']['tabs']['tablinks'][3]['#options']['html'] = TRUE;
+      $data['content']['content']['tabs']['tablinks'][3]['#title'] = '<div class="icon-wrapper icon-wrapper-show">
+                      <i class="fa fa fa-facebook-square fa-1x"></i><span class="menu-title">
+                  '.$data['content']['content']['tabs']['tablinks'][3]['#title'].'</span></div>';
+
+    }
+  }
+}
+
+
+/**
+ * Implements hook_theme()
+ */
+function fundmakr_theme($existing, $type, $theme, $path) {
+  return array(
+    'fundmakr_user_form_connect' => array(
+      'variables' => array('uid' => NULL, 'fbid' => NULL),
+    ),
+    'fundmakr_stripe_settings' => array(
+      'variables' => array('uid' => NULL),
+    ),
+    'fundmakr_progress_bar' => array(
+      'variables' => array('goal' => NULL, 'total_donation' => NULL),
+    ),
+  );
+}
+
+function theme_fundmakr_stripe_settings($variables) {
+  global $user;
+  $output = '';
+  $account = user_load($user->uid);
+  if (!empty($account->field_stripe_connect['und'][0]['stripe_access_token'])) {
+    $output .= '<p class="description">Your Stripe account is currently linked to Fundmakr to accept donations.</p><a href="https://manage.stripe.com/login" class="" target="_blank">Click here to login to your Stripe Account</a> <span class="glyphicon glyphicon-new-window"></span>';
+  }
+  else {
+    $stripe_button = '<img src="'.url(drupal_get_path('module', 'fundmakr_stripe_connect') . '/images/blue.png').'" />';
+    $path = 'https://connect.stripe.com/oauth/authorize?response_type=code&client_id='.variable_get('fundmakr_settings_client_id').'&scope=read_write&state=1234';
+    $link = l($stripe_button, $path, array('html' => TRUE));
+
+    $output.= $link;
+    $output.= '<div class="stripe-instructions">Please make sure your Profile Settings is done prior connecting with Stripe.</div>';
+  }
+
+  return $output;
+}
+
+function theme_fundmakr_user_form_connect($variables) {
+
+  global $user;
+
+  module_load_include('inc', 'fboauth', 'includes/fboauth.pages');
+
+  //$uid = $variables['uid'];
+  $fbid = $variables['fbid'];
+  if ($fbid) {
+    $output = fboauth_user_form($user);
+  }
+  else {
+    $output = fboauth_action_display('connect', $_GET['q']);
+    $output .= '<div class="description">' . t('Connect to Facebook allows Fundmakr to post on your Facebook wall each time you create a campaign.') . '</div>';
+  }
+  return $output;
+}
+
+function facebook_settings_form($form, &$form_state) {
+
+  global $user;
+
+  $fbid = fboauth_fbid_load($user->uid);
+
+  $fboauth_form = array(
+    '#type' => 'item',
+    '#markup' => theme('fundmakr_user_form_connect', array('uid' => $user->uid, 'fbid' => $fbid)),
+    '#weight' => 2
+  );
+
+  $form['fboauth'] = $fboauth_form;
+
+  $user_token_status = facebook_rules_get_token_status($user->uid);
+// Display a button to generate token if the access token has expired or access token is not set.
+  if (fboauth_fbid_load($user->uid)) {
+
+    if ($user_token_status == '1' || !facebook_rules_get_token($user->uid)) {
+
+      $form['facebook_rules'] = array(
+        '#type' => 'item',
+        '#weight' => '-6',
+        '#description' => t("If you see this button, you need to generate your Facebook access token. Either you have not generated it yet or it has expired."),
+        '#markup' => fboauth_action_display('facebook_rules_generate_token'),
+      );
+
+    }
+
+    $form['facebook_rules_allow'] = array(
+      '#type' => 'checkbox',
+      '#weight' => '-6',
+      '#title' => t("Allow " . variable_get('site_name', '') . " to post to your facebook wall on your behalf."),
+      '#default_value' => facebook_rules_profile_user_grant($user->uid),
+      '#disabled' => ($user_token_status == '1' || !facebook_rules_get_token($user->uid)) ? TRUE : FALSE,
+      '#description' => ($user_token_status == '1' || !facebook_rules_get_token($user->uid)) ? 'You need to have a valid access token to set or unset this option.' : '',
+    );
+
+    $form['submit'] = array(
+      '#value' => 'Save',
+      '#type' => 'submit',
+      '#submit' => array('facebook_rules_profile_submit'),
+    );
+
+    $form['#user'] = new stdClass();
+    $form['#user']->uid = $user->uid;
+
+    $form_state['user'] = new stdClass();
+    $form_state['user']->uid = $user->uid;
+  }
+
+
+
+  return $form;
+}
+
+/**
+ * Implements hook_msnf_info_steps_alter()
+ *
+ * Remove steps on edit form.
+ */
+
+function fundmakr_msnf_info_steps_alter(&$steps_cached, $entity_type, $bundle, $form) {
+
+if ($entity_type == 'node' && is_numeric(arg(1)) && arg(2) == 'edit') {
+    $steps_cached = array();
+  }
+
+}
+
+function fundmakr_user_insert(&$edit, &$account, $category = NULL) {
+
+  if (isset($edit['fboauth_fbid'])) {
+    // merge firstname & lastname then transform to lowercase
+
+    $new_name = strtolower($edit['field_first_name']['und'][0]['value'].$edit['field_last_name']['und'][0]['value']);
+
+
+    // Ensure whatever name we have is unique.
+    $new_name = fundmakr_unique_username($new_name, $account->uid);
+
+    // Replace with generated username.
+    db_update('users')
+        ->fields(array('name' => $new_name))
+        ->condition('uid', $account->uid)
+        ->execute();
+
+    $edit['name'] = $new_name;
+    $account->name = $new_name;
+
+
+    return;
+  }
+}
+
+function fundmakr_unique_username($name, $uid = 0) {
+    // Strip illegal characters.
+    $name = preg_replace('/[^\x{80}-\x{F7} a-zA-Z0-9@_.\'-]/', '', $name);
+
+    // Strip leading and trailing spaces.
+    $name = trim($name);
+
+    // Convert any other series of spaces to a single underscore.
+    $name = preg_replace('/ +/', '_', $name);
+
+    // If there's nothing left use a default.
+    $name = ('' === $name) ? t('user') : $name;
+
+    // Truncate to reasonable size.
+    $name = (drupal_strlen($name) > (USERNAME_MAX_LENGTH - 10)) ? drupal_substr($name, 0, USERNAME_MAX_LENGTH - 11) : $name;
+
+    // Iterate until we find a unique name.
+    $i = 0;
+    do {
+        $new_name = empty($i) ? $name : $name . '_' . $i;
+        $found = db_query_range("SELECT uid from {users} WHERE uid <> :uid AND name = :name", 0, 1, array(':uid' => $uid, ':name' => $new_name))->fetchAssoc();
+        $i++;
+    } while (!empty($found));
+
+    return $new_name;
+}
+
+function fundmakr_field_formatter_info() {
+  return array(
+    'progress_bar' => array(
+      'label' => t('Progress Bar Formatter'),
+      // The important bit...
+      'field types' => array('number_integer'),
+    ),
+  );
+}
+
+function fundmakr_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+
+  $element = array();
+
+  if ($display['type'] == 'progress_bar') {
+    foreach ($items as $delta => $item) {
+      $element[$delta] = array(
+                            '#markup' => theme('fundmakr_progress_bar', array('total_donation' => $entity->field_total_donation['und'][0]['value'], 'goal' => $item['value']))
+      );
+    }
+  }
+  return $element;
+}
+
+function theme_fundmakr_progress_bar($variables) {
+  $percent = percentage($variables['goal'], $variables['total_donation']);
+  $output = '';
+  $output .= '<div id="progress" class="progress">
+                 <div class="bar">
+                    <div class="filled" style="width: '.$percent.'%"></div>
+                 </div>
+                 <div class="percentage"></div>
+                 <div class="message"></div>
+              </div>';
+  return $output;
+}
+
+/**
+ * Get the Stripe publishable key since this is not present on Stripe module
+ */
+function stripe_get_secret_key() {
+  $status = variable_get('stripe_key_status', 'test');
+  $key_name = 'stripe_' . $status . '_secret';
+  return variable_get($key_name, '');
+}
+
+function check_zero_decimal_currency($currency_code) {
+
+  $currency_codes = array(
+    'BIF',
+    'CLP',
+    'DJF',
+    'GNF',
+    'JPY',
+    'KMF',
+    'KRW',
+    'MGA',
+    'PYG',
+    'RWF',
+    'VND',
+    'VUV',
+    'XAF',
+    'XOF',
+    'XPF'
+  );
+
+  return in_array($currency_code, $currency_codes);
+
+}
+// Implements hook_stripe_webhook() from stripe.module
+// @todo update full name on Payment line item
+
+/*function fundmakr_stripe_webhook($event) {
+  switch ($event->type) {
+    case 'charge.succeeded':
+      //$event->data->object->customer
+      watchdog('stripe', 'Stripe Webhook %type: <pre>@event</pre>', array(
+        '%type' =>  (is_object($event) && isset($event->type)) ? $event->type : t('<undefined>'),
+        '@event' => print_r($event, TRUE),
+      ), WATCHDOG_INFO);
+    break;
+  }
+}*/
+
